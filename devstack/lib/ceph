@@ -1,0 +1,374 @@
+#!/bin/bash
+
+# GENERIC CEPHADM INTERNAL OPTIONS, DO NOT EDIT
+CEPH_PUB_KEY="/etc/ceph/ceph.pub"
+CONFIG="/etc/ceph/ceph.conf"
+BOOTSTRAP_CONFIG="$HOME/bootstrap_ceph.conf"
+KEYRING="/etc/ceph/ceph.client.admin.keyring"
+REQUIREMENTS=("jq" "lvm" "python3")
+TARGET_BIN=/usr/bin
+
+# DEFAULT OPTIONS
+ATTEMPTS=30
+CONTAINER_IMAGE=${CONTAINER_IMAGE:-'quay.io/ceph/ceph:v16.2.6'}
+DEVICES=()
+FSID="4b5c8c0a-ff60-454b-a1b4-9747aa737d19"
+IP=${IP:-'127.0.0.1'}
+KEYS=("client.openstack") # at least the client.openstack default key should be created
+MIN_OSDS=1
+SERVICES=()
+SLEEP=5
+
+# POOLS
+# E.G. POOLS[test]='rbd'
+declare -A POOLS
+
+# NFS OPTIONS
+FSNAME=${FSNAME:-'cephfs'}
+NFS_PORT=12345
+NFS_CLIENT=0
+NFS_CLIENT_LOG="/var/log/ceph-$NFS_CLIENT_NAME.log"
+NFS_CLIENT_NAME="client.manila"
+
+# RGW OPTIONS
+RGW_PORT=8080
+
+# CLIENT CONFIG
+CLIENT_CONFIG=$HOME/ceph_client.conf
+EXPORT=$HOME/ceph_export.yml
+RBD_CLIENT_LOG=/var/log/ceph/qemu-guest-$pid.log
+
+[ -z "$SUDO" ] && SUDO=sudo
+
+## Admin
+
+# Admin: enable debug mode
+function set_debug {
+    if [ "$DEBUG" -eq 1 ]; then
+        echo "[CEPHADM] Enabling Debug mode"
+        $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+            --keyring $KEYRING -- ceph config set mgr mgr/cephadm/log_to_cluster_level debug
+        echo "[CEPHADM] See debug logs running: ceph -W cephadm --watch-debug"
+    fi
+}
+
+# Admin: check ceph cluster status
+function check_cluster_status {
+    $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+        --keyring $KEYRING -- ceph -s -f json-pretty
+}
+
+# Admin: export ceph cluster config spec
+function export_spec {
+    $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+        --keyring $KEYRING -- ceph orch ls --export > "$EXPORT"
+    echo "Ceph cluster config exported: $EXPORT"
+}
+
+## Pre-install
+
+# Pre-install ceph: check depdendencies are available
+function prereq {
+    for cmd in "${REQUIREMENTS[@]}"; do
+        if ! command -v "$cmd" &> /dev/null; then
+            echo "Command $cmd not found"
+            exit 1;
+        fi
+    done
+}
+
+# Pre-install ceph: show cluster status
+function preview {
+    echo "---------"
+    echo "SERVICES"
+    for daemon in "${SERVICES[@]}"; do
+        echo "* $daemon"
+    done
+
+    echo "---------"
+    echo "POOLS"
+    for key in "${!POOLS[@]}"; do
+        echo "* $key:${POOLS[$key]}";
+    done
+
+    echo "---------"
+    echo "KEYS"
+    for kname in "${KEYS[@]}"; do
+        echo "* $kname";
+    done
+
+    echo "---------"
+    echo "DEVICES"
+    for dev in "${DEVICES[@]}"; do
+        echo "* $dev"
+    done
+    [ -z "$DEVICES" ] && echo "Using ALL available devices"
+
+    echo "---------"
+    echo IP Address: "$IP"
+    echo "---------"
+    echo "Container Image: $CONTAINER_IMAGE"
+    echo "---------"
+}
+
+# Pre-install ceph: get cephadm binary
+function get_cephadm {
+    curl -O https://raw.githubusercontent.com/ceph/ceph/pacific/src/cephadm/cephadm
+    $SUDO mv cephadm $TARGET_BIN
+    $SUDO chmod +x $TARGET_BIN/cephadm
+    echo "[GET CEPHADM] cephadm is now available"
+
+    if [ -z "$CEPHADM" ]; then
+        CEPHADM=${TARGET_BIN}/cephadm
+    fi
+}
+
+# Pre-install ceph: bootstrap config
+function bootstrap_config {
+    cat <<EOF > "$BOOTSTRAP_CONFIG"
+    [global]
+    log to file = true
+    osd crush chooseleaf type = 0
+    osd_pool_default_pg_num = 8
+    osd_pool_default_pgp_num = 8
+    osd_pool_default_size = 1
+    [mon]
+    mon_warn_on_insecure_global_id_reclaim_allowed = False
+    mon_warn_on_pool_no_redundancy = False
+EOF
+}
+
+## Install
+
+# Install ceph: run cephadm bootstrap
+function start_ceph {
+    cluster=$(sudo cephadm ls | jq '.[]' | jq 'select(.name | test("^mon*")).fsid')
+    if [ -z "$cluster" ]; then
+    $SUDO $CEPHADM --image "$CONTAINER_IMAGE" \
+           bootstrap \
+           --fsid $FSID \
+           --config "$BOOTSTRAP_CONFIG" \
+           --output-config $CONFIG \
+           --output-keyring $KEYRING \
+           --output-pub-ssh-key $CEPH_PUB_KEY \
+           --allow-overwrite \
+           --allow-fqdn-hostname \
+           --skip-monitoring-stack \
+           --skip-dashboard \
+           --skip-firewalld \
+           --mon-ip "$IP"
+
+    test -e $CONFIG
+    test -e $KEYRING
+
+    # Wait cephadm backend to be operational
+    sleep "$SLEEP"
+    fi
+}
+
+# Install ceph: add osds
+function add_osds {
+    # let's add some osds
+    if [ -z "$DEVICES" ]; then
+        echo "Using ALL available devices"
+        $SUDO $CEPHADM shell ceph orch apply osd --all-available-devices
+    else
+        for item in "${DEVICES[@]}"; do
+            echo "Creating osd $item on node $HOSTNAME"
+            $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+                --keyring $KEYRING -- ceph orch daemon add osd "$HOSTNAME:$item"
+        done
+    fi
+
+    while [ "$ATTEMPTS" -ne 0 ]; do
+        num_osds=$($SUDO $CEPHADM shell --fsid $FSID --config $CONFIG \
+        --keyring $KEYRING -- ceph -s -f json | jq '.osdmap | .num_up_osds')
+        if [ "$num_osds" -ge "$MIN_OSDS" ]; then break; fi
+        ATTEMPTS=$(("$ATTEMPTS" - 1))
+        sleep 1
+    done
+    echo "[CEPHADM] OSD(s) deployed: $num_osds"
+
+    [ "$num_osds" -lt "$MIN_OSDS" ] && exit 255
+}
+
+# Install ceph: create and enable pools
+function add_pools {
+    # Pools are tied to their application, therefore the function
+    # iterates over the associative array that defines this relationship
+    # e.g. { 'volumes': 'rbd', 'manila_data': 'cephfs' }
+
+    [ "${#POOLS[@]}" -eq 0 ] && return;
+
+    for pool in "${!POOLS[@]}"; do
+        $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+            --keyring $KEYRING -- ceph osd pool create "$pool" "$DEFAULT_PG_NUM" \
+            "$DEFAULT_PGP_NUM" replicated --autoscale-mode on
+
+        # set the application to the pool (which also means rbd init the pool)
+        $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+            --keyring $KEYRING -- ceph osd pool application enable "$pool" "${POOLS[$pool]}"
+    done
+}
+
+# Install ceph: create a keyring
+function _create_key {
+    local name=$1
+    local caps
+    local osd_caps
+
+    if [ "${#POOLS[@]}" -eq 0 ]; then
+        osd_caps="allow *"
+    else
+        caps=$(build_caps)
+        osd_caps="allow class-read object_prefix rbd_children, $caps"
+    fi
+
+    $SUDO "$CEPHADM" shell -v "$KEY_EXPORT_DIR:$KEY_EXPORT_DIR" --fsid $FSID --config $CONFIG \
+        --keyring $KEYRING -- ceph auth get-or-create "$name" mon "allow r" osd "$osd_caps" \
+        -o "$KEY_EXPORT_DIR/$name.keyring"
+}
+
+# Install ceph: create one or more keyrings
+function create_keys {
+    for key_name in "${KEYS[@]}"; do
+        echo "Creating key $key_name"
+        _create_key "$key_name"
+    done
+}
+
+# Install ceph: add MDS
+function mds {
+    # Two pools are generated by this action
+    # - $FSNAME.FSNAME.data
+    # - $FSNAME.FSNAME.meta
+    $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+        --keyring $KEYRING -- ceph orch apply mds "$FSNAME" \
+        --placement="$HOSTNAME"
+    $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+        --keyring $KEYRING -- ceph fs volume create "$FSNAME" \
+        --placement="$HOSTNAME"
+}
+
+# Install ceph: add NFS
+function nfs {
+    echo "[CEPHADM] Deploy nfs.$FSNAME backend"
+    $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+        --keyring $KEYRING -- ceph orch apply nfs \
+        "$FSNAME" --placement="$HOSTNAME" --port $NFS_PORT
+}
+
+# Install ceph: add RGW
+function rgw {
+    $SUDO "$CEPHADM" shell --fsid $FSID --config $CONFIG \
+        --keyring $KEYRING -- ceph orch apply rgw default default default \
+        "--placement=$HOSTNAME count:1" --port "$RGW_PORT"
+}
+
+# Install ceph: services deployment
+function enable_services {
+    for item in "${SERVICES[@]}"; do
+        case "$item" in
+          mds|MDS)
+          echo "Deploying MDS on node $HOSTNAME"
+          mds
+          ;;
+          nfs|NFS)
+          echo "Deploying NFS on node $HOSTNAME"
+          nfs
+          NFS_CLIENT=1
+          ;;
+          rgw|RGW)
+          echo "Deploying RGW on node $HOSTNAME"
+          rgw
+          ;;
+        esac
+    done
+}
+
+# Install ceph: client config
+function client_config {
+    echo "Dump the minimal ceph.conf"
+    cp $CONFIG "$CLIENT_CONFIG"
+
+    cat >> "$CLIENT_CONFIG" <<-EOF
+        [client.libvirt]
+        admin socket = /var/run/ceph/$cluster-$type.$id.$pid.$cctid.asok
+        log file = $RBD_CLIENT_LOG
+EOF
+
+    if [ "$NFS_CLIENT" -eq 1 ]; then
+        cat >> "$CLIENT_CONFIG" <<-EOF
+            [$NFS_CLIENT_NAME]
+            client mount uid = 0
+            client mount gid = 0
+            log file = $NFS_CLIENT_LOG
+            admin socket = /var/run/ceph/\$cluster-\$type.\$id.\$pid.\$cctid.asok
+            keyring = $KEY_EXPORT_DIR/$NFS_CLIENT_NAME.keyring
+EOF
+        echo "Client config exported: $CLIENT_CONFIG"
+    fi
+}
+
+## Remove ceph
+
+# Remove ceph: remove cluster and zap osds
+function stop_ceph {
+    if ! [ -x "$CEPHADM" ]; then
+        install_cephadm
+        CEPHADM=${TARGET_BIN}/cephadm
+    fi
+    cluster=$(sudo cephadm ls | jq '.[]' | jq 'select(.name | test("^mon*")).fsid')
+    if [ -n "$cluster" ]; then
+        sudo cephadm rm-cluster --zap-osds --fsid "$FSID" --force
+        echo "[CEPHADM] Cluster deleted"
+    fi
+}
+
+## devstack-plugin-ceph functions
+
+function pre_install_ceph {
+    # Check dependencies for the service.
+    prereq
+}
+
+function install_ceph {
+    # Install the service.
+    bootstrap_config
+    get_cephadm
+}
+
+function configure_ceph {
+    # Configure the service.
+    # noop
+    :
+}
+
+function init_ceph {
+    # Initialize and start the service.
+    preview
+    start_ceph
+    # set_debug
+    add_osds
+    add_pools
+    create_keys
+    enable_services
+    check_cluster_status
+    client_config
+}
+
+function shutdown_ceph {
+    # Shut the service down.
+    stop_ceph
+}
+
+function cleanup_ceph {
+    # Cleanup the service.
+    # noop
+    :
+}
+
+# Tell emacs to use shell-script-mode
+## Local variables:
+## mode: shell-script
+## End:

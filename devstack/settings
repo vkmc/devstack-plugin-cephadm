@@ -1,0 +1,4 @@
+CEPH_PLUGIN_DIR=$(readlink -f $(dirname ${BASH_SOURCE[0]}))
+
+# Source plugin's lib/ceph
+source $CEPH_PLUGIN_DIR/lib/ceph
