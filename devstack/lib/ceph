@@ -13,7 +13,6 @@ ATTEMPTS=30
 CONTAINER_IMAGE=${CONTAINER_IMAGE:-'quay.io/ceph/ceph:v16.2.6'}
 DEVICES=()
 FSID="4b5c8c0a-ff60-454b-a1b4-9747aa737d19"
-IP=${IP:-'127.0.0.1'}
 KEYS=("client.openstack") # at least the client.openstack default key should be created
 MIN_OSDS=1
 SERVICES=()
@@ -105,7 +104,7 @@ function preview {
     [ -z "$DEVICES" ] && echo "Using ALL available devices"
 
     echo "---------"
-    echo IP Address: "$IP"
+    echo IP Address: "$HOST_IP"
     echo "---------"
     echo "Container Image: $CONTAINER_IMAGE"
     echo "---------"
@@ -156,7 +155,7 @@ function start_ceph {
            --skip-monitoring-stack \
            --skip-dashboard \
            --skip-firewalld \
-           --mon-ip "$IP"
+           --mon-ip "$HOST_IP"
 
     test -e $CONFIG
     test -e $KEYRING
