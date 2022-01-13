@@ -188,7 +188,7 @@ function add_osds {
     done
     echo "[CEPHADM] OSD(s) deployed: $num_osds"
 
-    [ "$num_osds" -lt "$MIN_OSDS" ] && exit 255
+    # [ "$num_osds" -lt "$MIN_OSDS" ] && exit 255
 }
 
 # Install ceph: create and enable pools
