@@ -15,7 +15,7 @@ DEVICES=()
 FSID="4b5c8c0a-ff60-454b-a1b4-9747aa737d19"
 KEYS=("client.openstack") # at least the client.openstack default key should be created
 MIN_OSDS=1
-SERVICES=()
+SERVICES=("NFS")
 SLEEP=5
 
 # POOLS
